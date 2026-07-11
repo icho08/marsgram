@@ -1,201 +1,144 @@
-import prisma from '../db.js';
-import { deleteFileFromStorage } from '../config/gcloud.js';
-import { AuthReq, MayHaveImage, PostUpdateData } from '../types/types.js';
-import { NextFunction, Response, Request } from 'express';
+import { Response } from "express";
+import prisma from "../db.js";
+import { AuthReq } from "../types.js";
 
-// Creates a post
-export const createPost = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	// If no image url is passed from the upload middleware, handle it at the top-level (server.js) as 500 error
-	if (!(req as Request & MayHaveImage).image) {
-		const e = new Error();
-		next(e);
-		return;
-	}
-
-	try {
-		// First, create post
-		const post = await prisma.post.create({
-			data: {
-				image: (req as Request & MayHaveImage).image,
-				caption: req.body.caption,
-				userId: (req as AuthReq).user.id,
-			},
-		});
-		// If no post is created, handle it at the top-level (server.js) as 500 error
-		if (!post) throw new Error();
-		// Second, send post data back to client
-		res.json({ post });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+const withCounts = async (postId: number, userId: number) => {
+  const [likeCount, isLiked, isSaved] = await Promise.all([
+    prisma.like.count({ where: { postId } }),
+    prisma.like.findUnique({ where: { userId_postId: { userId, postId } } }),
+    prisma.save.findUnique({ where: { userId_postId: { userId, postId } } }),
+  ]);
+  return { likeCount, isLiked: Boolean(isLiked), isSaved: Boolean(isSaved) };
 };
 
-// Gets a post based on a single post's id (if it exists)
-export const getSinglePost = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, get post by id
-		// If no post is found, handle it at the top-level (server.js) as 500 error
-		const post = await prisma.post.findUnique({
-			where: { id: req.body.id },
-			include: {
-				_count: {
-					select: {
-						comments: true,
-						likes: true,
-					},
-				},
-				user: true,
-			},
-		});
-		if (!post) throw new Error();
-		// Second, return data back to client
-		res.json({ post });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+const serializePost = async (post: any, userId: number) => {
+  const { likeCount, isLiked, isSaved } = await withCounts(post.id, userId);
+  return {
+    id: post.id,
+    createdAt: post.createdAt,
+    image: post.image,
+    caption: post.caption,
+    user: post.user,
+    commentCount: post._count?.comments ?? post.comments?.length ?? 0,
+    likeCount,
+    isLiked,
+    isSaved,
+  };
 };
 
-// Gets all posts from a single user by id
-export const getPosts = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, get all posts with limit
-		// If no posts are found, handle it at the top-level (server.js) as 500 error
-		const posts = await prisma.post.findMany({
-			take: req.body.limit,
-			orderBy: { createdAt: 'desc' },
-			include: {
-				_count: {
-					select: {
-						comments: true,
-						likes: true,
-					},
-				},
-				user: true,
-			},
-		});
-		if (!posts) throw new Error();
-		// Second, return data back to client
-		res.json({ posts });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+const PAGE_SIZE = 12;
+const MAX_PAGE_SIZE = 50;
+
+// Parses `?cursor=<postId>&limit=n` pagination params shared by the paginated post endpoints.
+const parsePageParams = (req: AuthReq) => {
+  const cursor = req.query.cursor ? Number(req.query.cursor) : undefined;
+  const limitRaw = req.query.limit ? Number(req.query.limit) : PAGE_SIZE;
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), MAX_PAGE_SIZE) : PAGE_SIZE;
+  return { cursor: Number.isFinite(cursor) ? cursor : undefined, limit };
 };
 
-// Gets all posts from a single user by id
-export const getUserPosts = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, confirm if provided user exists
-		// If no user is found, handle it at the top-level (server.js) as 500 error
-		const otherUser = await prisma.user.findUnique({
-			where: { id: req.body.id },
-		});
-		if (!otherUser) throw new Error();
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-
-	try {
-		// Second, get posts by user id
-		// If no post is found, handle it at the top-level (server.js) as 500 error
-		const posts = await prisma.post.findMany({
-			where: { userId: req.body.id },
-			take: req.body.limit,
-			orderBy: { createdAt: 'desc' },
-			include: {
-				_count: {
-					select: {
-						comments: true,
-						likes: true,
-					},
-				},
-			},
-		});
-		if (!posts) throw new Error();
-		// Second, return data back to client
-		res.json({ posts });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+// Fetches one page of posts ordered newest-first, using the last post id on the
+// previous page as an opaque cursor so results stay stable as new posts are added.
+const paginate = async (where: Record<string, unknown>, req: AuthReq) => {
+  const { cursor, limit } = parsePageParams(req);
+  const posts = await prisma.post.findMany({
+    where,
+    orderBy: { id: "desc" },
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    include: {
+      user: { select: { id: true, username: true, location: true } },
+      _count: { select: { comments: true } },
+    },
+  });
+  const hasMore = posts.length > limit;
+  const page = hasMore ? posts.slice(0, limit) : posts;
+  const serialized = await Promise.all(page.map((p) => serializePost(p, req.user!.id)));
+  return { posts: serialized, nextCursor: hasMore ? page[page.length - 1].id : null };
 };
 
-// Deletes a post
-export const deletePost = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, delete the post
-		const post = await prisma.post.delete({
-			where: { id: req.body.id },
-		});
-		// If no post is found-and-deleted, handle it at the top-level (server.js) as 500 error
-		if (!post) throw new Error();
-		// Second, delete file of deleted post from storage
-		await deleteFileFromStorage(post.image);
-		// Finally, send deleted follow data back to client
-		res.json({ post });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+export const getFeed = async (req: AuthReq, res: Response) => {
+  res.json(await paginate({}, req));
 };
 
-// Updates a post
-export const updatePost = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	// Format data needed for update
-	const keys = ['caption'];
-	const data: PostUpdateData = {};
-	keys.forEach((key) => {
-		// @ts-ignore
-		if (req.body[key]) data[key] = req.body[key];
-	});
+export const createPost = async (req: AuthReq, res: Response) => {
+  const { image, caption } = req.body;
+  try {
+    const post = await prisma.post.create({
+      data: { image, caption: caption ?? "", userId: req.user!.id },
+      include: {
+        user: { select: { id: true, username: true, location: true } },
+        _count: { select: { comments: true } },
+      },
+    });
+    res.status(201).json(await serializePost(post, req.user!.id));
+  } catch (e) {
+    res.status(500).json({ message: "Could not create post" });
+  }
+};
 
-	try {
-		// Update post
-		const post = await prisma.post.update({
-			where: { id: req.body.id },
-			data,
-		});
-		// While the previous try/catch (along with the 'protect' middleware) should catch all errors,
-		// this is added as an extra step of error handling (in case the update 'runs' but nothing is returned).
-		if (!post) throw new Error();
-		// Return updated user data
-		res.json({ post });
-	} catch (e) {
-		// If error, handle it as a 500 error
-		next(e);
-		return;
-	}
+const INITIAL_COMMENT_PAGE_SIZE = 20;
+
+export const getPost = async (req: AuthReq, res: Response) => {
+  const id = Number(req.params.id);
+  const post = await prisma.post.findUnique({
+    where: { id },
+    include: {
+      user: { select: { id: true, username: true, location: true } },
+      // Only the first page ships with the post; the client pages the rest via
+      // GET /posts/:id/comments to keep large threads from loading all at once.
+      comments: {
+        orderBy: { id: "asc" },
+        take: INITIAL_COMMENT_PAGE_SIZE + 1,
+        include: { user: { select: { id: true, username: true } } },
+      },
+      _count: { select: { comments: true } },
+    },
+  });
+  if (!post) {
+    res.status(404).json({ message: "Post not found" });
+    return;
+  }
+  const hasMoreComments = post.comments.length > INITIAL_COMMENT_PAGE_SIZE;
+  const comments = hasMoreComments ? post.comments.slice(0, INITIAL_COMMENT_PAGE_SIZE) : post.comments;
+  const serialized = await serializePost(post, req.user!.id);
+  res.json({
+    ...serialized,
+    comments,
+    nextCommentCursor: hasMoreComments ? comments[comments.length - 1].id : null,
+  });
+};
+
+export const getPostsByUsername = async (req: AuthReq, res: Response) => {
+  const { username } = req.params;
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) {
+    res.status(404).json({ message: "User not found" });
+    return;
+  }
+  res.json(await paginate({ userId: user.id }, req));
+};
+
+export const getSavedPosts = async (req: AuthReq, res: Response) => {
+  const { cursor, limit } = parsePageParams(req);
+  const saves = await prisma.save.findMany({
+    where: {
+      userId: req.user!.id,
+      ...(cursor ? { postId: { lt: cursor } } : {}),
+    },
+    orderBy: { postId: "desc" },
+    take: limit + 1,
+    include: {
+      post: {
+        include: {
+          user: { select: { id: true, username: true, location: true } },
+          _count: { select: { comments: true } },
+        },
+      },
+    },
+  });
+  const hasMore = saves.length > limit;
+  const page = hasMore ? saves.slice(0, limit) : saves;
+  const serialized = await Promise.all(page.map((s) => serializePost(s.post, req.user!.id)));
+  res.json({ posts: serialized, nextCursor: hasMore ? page[page.length - 1].postId : null });
 };

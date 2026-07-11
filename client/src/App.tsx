@@ -1,61 +1,104 @@
-import { Route, Navigate, BrowserRouter, Routes } from 'react-router-dom';
-import { useState, useEffect } from 'react';
-import { Home } from './components/Home/Home.js';
-import { Messages } from './components/Messages/Messages.js';
-import { PostPage } from './components/Post/Post.js';
-import { Profile } from './components/Profile/Profile.js';
-import { Settings } from './components/Settings/Settings.js';
-import { Saved } from './components/SavedPosts/Saved.js';
-import { SignUp } from './components/SignUp/SignUp.js';
-import { Login } from './components/Login/Login.js';
-import { ConvoPage } from './components/Conversation/Conversation.js';
-import { useAuth } from './contexts/AuthContext.js';
-import { getLocalUser } from './services/localstor.js';
-import { HomeLoggedOut } from './components/Home/HomeLoggedOut.js';
-import './components/other/other.css';
+import { Navigate, Route, Routes } from "react-router-dom";
+import { useAuth } from "@/contexts/AuthContext";
+import LoginPage from "@/pages/Login";
+import SignUpPage from "@/pages/Signup";
+import FeedPage from "@/pages/Feed";
+import PostDetailPage from "@/pages/PostDetail";
+import ProfilePage from "@/pages/Profile";
+import MessagesIndexPage from "@/pages/MessagesIndex";
+import ConversationPage from "@/pages/Conversation";
+import SavedPage from "@/pages/Saved";
+import SettingsPage from "@/pages/Settings";
 
-const App = () => {
-	// Init user context
-	const { user, setUser } = useAuth();
+function RequireAuth({ children }: { children: React.ReactNode }) {
+  const { user, isLoading } = useAuth();
+  if (isLoading) return null;
+  if (!user) return <Navigate to="/login" replace />;
+  return <>{children}</>;
+}
 
-	// Init loading state
-	const [isLoading, setIsLoading] = useState(true);
+function RedirectIfAuthed({ children }: { children: React.ReactNode }) {
+  const { user, isLoading } = useAuth();
+  if (isLoading) return null;
+  if (user) return <Navigate to="/" replace />;
+  return <>{children}</>;
+}
 
-	// Update user (with anything stored locally) and loading states on mount
-	useEffect(() => {
-		const localUser = getLocalUser();
-		if (localUser && !user && setUser) {
-			setUser(localUser);
-			setIsLoading(false);
-		} else {
-			setIsLoading(false);
-		}
-	}, []);
-
-	// return routes;
-	return isLoading == false && user ? (
-		<BrowserRouter>
-			<Routes>
-				<Route path='/' element={<Home />} />
-				<Route path='/messages' element={<Messages />} />
-				<Route path='/:postOwnerId/:postId' element={<PostPage />} />
-				<Route path='/:otherUserId' element={<Profile />} />
-				<Route path='/messages/:otherUserId' element={<ConvoPage />} />
-				<Route path='/saved' element={<Saved />} />
-				<Route path='/settings' element={<Settings />} />
-				<Route path='/signup' element={<Navigate to='/' replace />} />
-				<Route path='/login' element={<Navigate to='/' replace />} />
-			</Routes>
-		</BrowserRouter>
-	) : isLoading == false && !user ? (
-		<BrowserRouter>
-			<Routes>
-				<Route path='/signup' element={<SignUp />} />
-				<Route path='/login' element={<Login />} />
-				<Route path='*' element={<HomeLoggedOut />} />
-			</Routes>
-		</BrowserRouter>
-	) : null;
-};
-
-export { App };
+export default function App() {
+  return (
+    <Routes>
+      <Route
+        path="/login"
+        element={
+          <RedirectIfAuthed>
+            <LoginPage />
+          </RedirectIfAuthed>
+        }
+      />
+      <Route
+        path="/signup"
+        element={
+          <RedirectIfAuthed>
+            <SignUpPage />
+          </RedirectIfAuthed>
+        }
+      />
+      <Route
+        path="/"
+        element={
+          <RequireAuth>
+            <FeedPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/saved"
+        element={
+          <RequireAuth>
+            <SavedPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/settings"
+        element={
+          <RequireAuth>
+            <SettingsPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/messages"
+        element={
+          <RequireAuth>
+            <MessagesIndexPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/messages/:otherUsername"
+        element={
+          <RequireAuth>
+            <ConversationPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/:username/:postId"
+        element={
+          <RequireAuth>
+            <PostDetailPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/:username"
+        element={
+          <RequireAuth>
+            <ProfilePage />
+          </RequireAuth>
+        }
+      />
+    </Routes>
+  );
+}

@@ -1,144 +1,71 @@
-import { NextFunction, Response, Request } from 'express';
-import prisma from '../db.js';
-import { AuthReq } from '../types/types.js';
-import { Conversation } from '@prisma/client';
+import { Response } from "express";
+import prisma from "../db.js";
+import { AuthReq } from "../types.js";
 
-// Creates a conversation
-export const createConversation = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, attempt to create conversation
-		const conversation = await prisma.conversation.create({
-			data: {
-				users: {
-					connect: [
-						{ id: (req as AuthReq).user.id },
-						{ id: req.body.id },
-					],
-				},
-			},
-			include: {
-				users: true,
-				messages: true,
-			},
-		});
-		// If no conversation is created, handle it at the top-level (server.js) as 500 error
-		if (!conversation) throw new Error();
-		// Second, send conversation data back to client
-		res.json({ conversation });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+export const getConversations = async (req: AuthReq, res: Response) => {
+  const userId = req.user!.id;
+  const conversations = await prisma.conversation.findMany({
+    where: { users: { some: { id: userId } } },
+    include: {
+      users: { select: { id: true, username: true, location: true } },
+      messages: { orderBy: { createdAt: "desc" }, take: 1 },
+    },
+  });
+  const serialized = conversations
+    .map((c) => ({
+      id: c.id,
+      otherUser: c.users.find((u) => u.id !== userId),
+      lastMessage: c.messages[0] ?? null,
+    }))
+    .filter((c) => c.otherUser)
+    .sort((a, b) => {
+      const at = a.lastMessage?.createdAt ? new Date(a.lastMessage.createdAt).getTime() : 0;
+      const bt = b.lastMessage?.createdAt ? new Date(b.lastMessage.createdAt).getTime() : 0;
+      return bt - at;
+    });
+  res.json(serialized);
 };
 
-// Attempts to get a conversation by the other user's id
-export const getConversation = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, try to get single conversation by other user id
-		// If no conversations are found, handle it at the top-level (server.js) as 500 error
-		const conversation = await prisma.conversation.findFirst({
-			where: {
-				AND: [
-					{
-						users: {
-							some: {
-								id: (req as AuthReq).user.id,
-							},
-						},
-					},
-					{
-						users: {
-							some: {
-								id: req.body.id,
-							},
-						},
-					},
-				],
-			},
-			include: {
-				users: true,
-				messages: {
-					orderBy: { createdAt: 'desc' },
-					take: req.body.limit,
-				},
-			},
-		});
+// Finds (or creates) the 1:1 conversation between the current user and another user
+// (identified by username), then returns it with full message history.
+export const getOrCreateConversationWithUser = async (req: AuthReq, res: Response) => {
+  const userId = req.user!.id;
+  const otherUsername = req.params.otherUsername;
 
-		if (!conversation) throw new Error();
+  const otherUser = await prisma.user.findUnique({ where: { username: otherUsername } });
+  if (!otherUser) {
+    res.status(404).json({ message: "User not found" });
+    return;
+  }
+  const otherUserId = otherUser.id;
+  if (otherUserId === userId) {
+    res.status(400).json({ message: "Cannot message yourself" });
+    return;
+  }
 
-		// Second, return conversation back to client
-		res.json({ conversation });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-};
+  let conversation = await prisma.conversation.findFirst({
+    where: {
+      AND: [{ users: { some: { id: userId } } }, { users: { some: { id: otherUserId } } }],
+    },
+    include: {
+      users: { select: { id: true, username: true, location: true } },
+      messages: { orderBy: { createdAt: "asc" } },
+    },
+  });
 
-// Gets conversations from user
-export const getConversations = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, get all conversations from user
-		// If no conversations are found, handle it at the top-level (server.js) as 500 error
-		const conversations = await prisma.conversation.findMany({
-			where: {
-				users: {
-					some: {
-						id: (req as AuthReq).user.id,
-					},
-				},
-			},
-			take: req.body.limit,
-			include: {
-				users: true,
-				messages: { orderBy: { createdAt: 'desc' }, take: 1 },
-			},
-		});
-		if (!conversations) throw new Error();
-		// Second, return conversations back to client
-		res.json({ conversations });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-};
+  if (!conversation) {
+    conversation = await prisma.conversation.create({
+      data: { users: { connect: [{ id: userId }, { id: otherUserId }] } },
+      include: {
+        users: { select: { id: true, username: true, location: true } },
+        messages: { orderBy: { createdAt: "asc" } },
+      },
+    });
+  }
 
-// Deletes a conversation
-export const deleteConversation = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, attempt to delete the conversation
-		const conversation = await prisma.conversation.delete({
-			where: { id: req.body.id },
-			include: {
-				users: true,
-				messages: true,
-			},
-		});
-		// If no conversation is found-and-deleted, handle it at the top-level (server.js) as 500 error
-		if (!conversation) throw new Error();
-		// Finally, send deleted conversation back to client
-		res.json({ conversation });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+  res.json({
+    id: conversation.id,
+    otherUser: conversation.users.find((u) => u.id !== userId),
+    messages: conversation.messages,
+  });
 };

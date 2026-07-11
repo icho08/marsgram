@@ -1,125 +1,41 @@
-import { NextFunction, Response, Request } from 'express';
-import prisma from '../db.js';
-import { AuthReq } from '../types/types.js';
+import { Response } from "express";
+import prisma from "../db.js";
+import { AuthReq } from "../types.js";
 
-// Creates a comment
-export const createComment = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, attempt to create comment
-		const comment = await prisma.comment.create({
-			data: {
-				message: req.body.message,
-				postId: req.body.id,
-				userId: (req as AuthReq).user.id,
-			},
-			include: { user: true },
-		});
-		// If no comment is created, handle it at the top-level (server.js) as 500 error
-		if (!comment) throw new Error();
+const COMMENT_PAGE_SIZE = 20;
+const MAX_COMMENT_PAGE_SIZE = 100;
 
-		// Second, send comment data back to client
-		res.json({ comment });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
+// Comments are shown oldest-first, so pagination pages forward using the last
+// comment id seen as the cursor (id ordering matches createdAt ordering here).
+export const getComments = async (req: AuthReq, res: Response) => {
+  const postId = Number(req.params.postId);
+  const cursor = req.query.cursor ? Number(req.query.cursor) : undefined;
+  const limitRaw = req.query.limit ? Number(req.query.limit) : COMMENT_PAGE_SIZE;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.min(Math.max(limitRaw, 1), MAX_COMMENT_PAGE_SIZE)
+    : COMMENT_PAGE_SIZE;
+
+  const comments = await prisma.comment.findMany({
+    where: { postId, ...(cursor ? { id: { gt: cursor } } : {}) },
+    orderBy: { id: "asc" },
+    take: limit + 1,
+    include: { user: { select: { id: true, username: true } } },
+  });
+  const hasMore = comments.length > limit;
+  const page = hasMore ? comments.slice(0, limit) : comments;
+  res.json({ comments: page, nextCursor: hasMore ? page[page.length - 1].id : null });
 };
 
-// Gets (limited number of) comments from post
-export const getComments = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, get all comments from post with limit
-		// If no comments are found, handle it at the top-level (server.js) as 500 error
-		const comments = await prisma.comment.findMany({
-			where: { postId: req.body.id },
-			take: req.body.limit,
-			include: { user: true },
-			orderBy: { createdAt: 'desc' },
-		});
-
-		if (!comments) throw new Error();
-
-		// Second, return comments back to client
-		res.json({ comments });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-};
-
-// Gets a single comment by id
-export const getSingleComment = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, get commend by id
-		// If no comment is found, handle it at the top-level (server.js) as 500 error
-		const comment = await prisma.comment.findUnique({
-			where: { id: req.body.id },
-		});
-		if (!comment) throw new Error();
-		// Second, return comment back to client
-		res.json({ comment });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-};
-
-// Deletes a comment
-export const deleteComment = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, attempt to delete the comment
-		const comment = await prisma.comment.delete({
-			where: { id: req.body.id },
-		});
-		// If no comment is found-and-deleted, handle it at the top-level (server.js) as 500 error
-		if (!comment) throw new Error();
-		// Finally, send deleted comment back to client
-		res.json({ comment });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-};
-
-// Updates a comment
-export const updateComment = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// Attempt to update comment
-		const comment = await prisma.comment.update({
-			where: { id: req.body.id },
-			data: { message: req.body.message },
-		});
-		// While the previous try/catch (along with the 'protect' middleware) should catch all errors,
-		// this is added as an extra step of error handling (in case the update 'runs' but nothing is returned).
-		if (!comment) throw new Error();
-		// Return updated comment
-		res.json({ comment });
-	} catch (e) {
-		// If error, handle it as a 500 error
-		next(e);
-	}
+export const createComment = async (req: AuthReq, res: Response) => {
+  const postId = Number(req.params.postId);
+  const { message } = req.body;
+  try {
+    const comment = await prisma.comment.create({
+      data: { message, userId: req.user!.id, postId },
+      include: { user: { select: { id: true, username: true } } },
+    });
+    res.status(201).json(comment);
+  } catch (e) {
+    res.status(500).json({ message: "Could not create comment" });
+  }
 };

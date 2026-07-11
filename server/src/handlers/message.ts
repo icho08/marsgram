@@ -1,86 +1,28 @@
-import { NextFunction, Response, Request } from 'express';
-import prisma from '../db.js';
-import { AuthReq, HasId, HasMessage } from '../types/types.js';
-import { Message } from '@prisma/client';
+import { Response } from "express";
+import prisma from "../db.js";
+import { AuthReq } from "../types.js";
+import type { Server as SocketServer } from "socket.io";
 
-// Creates a message
-export const createMessage = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, attempt to create message
-		const message = await prisma.message.create({
-			data: {
-				conversationId: req.body.id,
-				senderId: (req as AuthReq).user.id,
-				message: req.body.message,
-			},
-		});
-		// If no message is created, handle it at the top-level (server.js) as 500 error
-		if (!message) throw new Error();
-		// Second, send message data back to client
-		res.json({ message });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-};
+export const createMessage =
+  (io: SocketServer) =>
+  async (req: AuthReq, res: Response) => {
+    const conversationId = Number(req.params.conversationId);
+    const { message } = req.body;
+    const senderId = req.user!.id;
 
-// Gets messages from user
-export const getMessages = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	// First, get all messages from user
-	// If no messages are found, handle it at the top-level (server.js) as 500 error
-	let messages: Message[] | undefined;
-	try {
-		messages = await prisma.message.findMany({
-			where: {
-				conversationId: req.body.id,
-			},
-		});
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-	if (!messages) {
-		const e = new Error();
-		next(e);
-		return;
-	}
+    const conversation = await prisma.conversation.findFirst({
+      where: { id: conversationId, users: { some: { id: senderId } } },
+      include: { users: true },
+    });
+    if (!conversation) {
+      res.status(404).json({ message: "Conversation not found" });
+      return;
+    }
 
-	// Second, return messages back to client
-	res.json({ messages });
-};
+    const created = await prisma.message.create({
+      data: { conversationId, senderId, message },
+    });
 
-// Deletes a message
-export const deleteMessage = async (
-	req: Request,
-	res: Response,
-	next: NextFunction
-) => {
-	try {
-		// First, attempt to delete the message
-		const message = await prisma.message.delete({
-			where: { id: req.body.id },
-		});
-		// If no message is found-and-deleted, handle it at the top-level (server.js) as 500 error
-		if (!message) {
-			const e = new Error();
-			next(e);
-			return;
-		}
-		// Finally, send deleted message back to client
-		res.json({ message });
-	} catch (e) {
-		// DB errors are handled at top-level (server.js) as 500 error
-		next(e);
-		return;
-	}
-};
+    io.to(`conversation:${conversationId}`).emit("newMessage", created);
+    res.status(201).json(created);
+  };
